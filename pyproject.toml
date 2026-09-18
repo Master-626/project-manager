@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "project-manager"
+version = "0.1.0"
+description = "A powerful project management CLI with task tracking, time logging, and reports."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Xu Jiaqi", email = "jiaqixu12138@gmail.com" }]
+dependencies = ["click>=8.0.0", "rich>=13.0.0"]
+
+[project.scripts]
+project-manager = "project_manager.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Master-626/project-manager"
