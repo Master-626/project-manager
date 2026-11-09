@@ -9,7 +9,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Python 3.8 builds are unavailable on Ubuntu 26.04 (ubuntu-latest).
+          - os: ubuntu-22.04
             python: '3.8'
           - os: ubuntu-latest
             python: '3.12'
