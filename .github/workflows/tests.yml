@@ -1,0 +1,35 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.8 builds are unavailable on Ubuntu 26.04 (ubuntu-latest).
+          - os: ubuntu-22.04
+            python: '3.8'
+          - os: ubuntu-latest
+            python: '3.12'
+          - os: ubuntu-latest
+            python: '3.14'
+          - os: windows-latest
+            python: '3.12'
+          - os: macos-latest
+            python: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install '.[dev]'
+      - run: python -m pytest
+      - run: python -m compileall -q src scripts
+      - run: python -m build
+      - name: Check installed console command
+        run: |
+          python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', glob.glob('dist/*.whl')[0]])"
+          python scripts/wheel_smoke.py
