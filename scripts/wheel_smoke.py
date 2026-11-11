@@ -41,6 +41,12 @@ with tempfile.TemporaryDirectory(prefix="project-manager-wheel-") as directory:
     assert "Completed" in run("list")
     assert "already completed" in run("done", "1")
     run("done", "999", success=False)
+    assert "Added task #2" in run("add", "temporary")
+    assert "Deleted task #2" in run("delete", "2")
+    listed = run("list")
+    assert "temporary" not in listed
+    assert "任务 [bold]literal[/bold]" in listed
+    run("delete", "2", success=False)
 print(
-    "Installed project-manager console: persistent add/list/done and error checks passed."
+    "Installed project-manager console: persistent add/list/done/delete and error checks passed."
 )

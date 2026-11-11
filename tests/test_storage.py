@@ -23,6 +23,8 @@ def test_empty_store_does_not_create_file(store):
     assert not store.path.parent.exists()
     with pytest.raises(TaskNotFound):
         store.complete(1)
+    with pytest.raises(TaskNotFound):
+        store.delete(1)
     assert not store.path.parent.exists()
 
 
@@ -49,7 +51,21 @@ def test_priorities(store, priority):
 
 @pytest.mark.parametrize(
     "title",
-    ["", "   ", "\n\t", "has\x00null", "x\x1b[31m", "x\nnext", "x\x7f", "x\x85"],
+    [
+        "",
+        "   ",
+        "\n\t",
+        "has\x00null",
+        "x\x1b[31m",
+        "x\nnext",
+        "x\x7f",
+        "x\x85",
+        "\u200b",
+        "\ufeff",
+        "\u00a0",
+        "a\u2028b",
+        "a\u2029b",
+    ],
 )
 def test_invalid_titles_make_no_database(store, title):
     with pytest.raises(ValueError):
@@ -67,6 +83,8 @@ def test_invalid_priority_makes_no_database(store):
 def test_invalid_id(store, task_id):
     with pytest.raises(ValueError):
         store.complete(task_id)
+    with pytest.raises(ValueError):
+        store.delete(task_id)
     assert not store.path.exists()
 
 
@@ -75,6 +93,8 @@ def test_missing_id_does_not_modify_store(store):
     before = store.path.read_bytes()
     with pytest.raises(TaskNotFound):
         store.complete(2)
+    with pytest.raises(TaskNotFound):
+        store.delete(2)
     assert store.path.read_bytes() == before
 
 
@@ -83,7 +103,12 @@ def test_corrupt_database_is_preserved(tmp_path):
     original = b"not a database: irreplaceable user data"
     path.write_bytes(original)
     store = TaskStore(path)
-    for action in (store.list_tasks, lambda: store.add("x"), lambda: store.complete(1)):
+    for action in (
+        store.list_tasks,
+        lambda: store.add("x"),
+        lambda: store.complete(1),
+        lambda: store.delete(1),
+    ):
         with pytest.raises(StorageError):
             action()
         assert path.read_bytes() == original
@@ -100,7 +125,12 @@ def test_unsupported_store_is_preserved(tmp_path, case):
             con.execute("PRAGMA user_version={}".format(99 if case == "future" else 1))
     before = path.read_bytes()
     store = TaskStore(path)
-    for action in (store.list_tasks, lambda: store.add("x"), lambda: store.complete(1)):
+    for action in (
+        store.list_tasks,
+        lambda: store.add("x"),
+        lambda: store.complete(1),
+        lambda: store.delete(1),
+    ):
         with pytest.raises(StorageError):
             action()
         assert path.read_bytes() == before
@@ -180,6 +210,7 @@ def test_altered_schema_cannot_report_fake_success(store, name, body):
         store.list_tasks,
         lambda: store.add("new"),
         lambda: store.complete(1),
+        lambda: store.delete(1),
     ):
         with pytest.raises(StorageError):
             action()
@@ -206,7 +237,7 @@ def test_invalid_saved_data_fails_cleanly(store, column, value):
         con.execute("PRAGMA ignore_check_constraints=ON")
         con.execute("UPDATE tasks SET {}=? WHERE id=1".format(column), (value,))
     before = store.path.read_bytes()
-    for action in (store.list_tasks, lambda: store.complete(1)):
+    for action in (store.list_tasks, lambda: store.complete(1), lambda: store.delete(1)):
         with pytest.raises(StorageError):
             action()
         assert store.path.read_bytes() == before
@@ -223,6 +254,8 @@ def test_dangling_symlink_is_not_reported_as_empty(tmp_path):
         store.list_tasks()
     with pytest.raises(StorageError):
         store.complete(1)
+    with pytest.raises(StorageError):
+        store.delete(1)
 
 
 def test_modified_constraints_rejected_without_mutation(tmp_path):
@@ -249,6 +282,71 @@ def test_fifo_database_rejected_without_opening(tmp_path):
     path = tmp_path / "fifo"
     os.mkfifo(str(path))
     store = TaskStore(path)
-    for action in (store.list_tasks, lambda: store.add("x"), lambda: store.complete(1)):
+    for action in (
+        store.list_tasks,
+        lambda: store.add("x"),
+        lambda: store.complete(1),
+        lambda: store.delete(1),
+    ):
         with pytest.raises(StorageError, match="regular file"):
             action()
+
+
+def test_visible_titles_keep_format_characters(store):
+    emoji = "团队 👨‍👩‍👧"
+    assert store.add("  " + emoji + "  ").title == emoji
+    assert store.add("a\u200bb").title == "a\u200bb"
+
+
+def test_delete_keeps_other_tasks_and_does_not_reuse_ids(store):
+    first = store.add("keep", "high")
+    second = store.add("drop")
+    done, changed = store.complete(first.id)
+    assert changed and done.done
+    removed = store.delete(second.id)
+    assert removed.id == second.id and removed.title == "drop"
+    assert TaskStore(store.path).list_tasks() == [done]
+    with pytest.raises(TaskNotFound):
+        store.delete(second.id)
+    assert store.add("next").id == 3
+
+
+def test_preexisting_non_sqlite_is_not_replaced(tmp_path):
+    for original in (b"", b"x", b"not a database: keep me"):
+        path = tmp_path / "db-{}".format(len(original))
+        path.write_bytes(original)
+        store = TaskStore(path)
+        for action in (
+            store.list_tasks,
+            lambda: store.add("x"),
+            lambda: store.complete(1),
+            lambda: store.delete(1),
+        ):
+            with pytest.raises(StorageError):
+                action()
+            assert path.read_bytes() == original
+
+
+def test_preexisting_blank_sqlite_is_not_adopted(tmp_path):
+    path = tmp_path / "blank.sqlite3"
+    with sqlite3.connect(str(path)) as connection:
+        connection.execute("CREATE TABLE scratch (id INTEGER)")
+        connection.execute("DROP TABLE scratch")
+    before = path.read_bytes()
+    assert before.startswith(b"SQLite format 3")
+    store = TaskStore(path)
+    for action in (store.list_tasks, lambda: store.add("x"), lambda: store.delete(1)):
+        with pytest.raises(StorageError):
+            action()
+        assert path.read_bytes() == before
+
+
+def test_tilde_database_path(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    store = TaskStore("~/tasks.sqlite3")
+    assert store.path == home / "tasks.sqlite3"
+    store.add("tilde")
+    assert [task.title for task in TaskStore(store.path).list_tasks()] == ["tilde"]
