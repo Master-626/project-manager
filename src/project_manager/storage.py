@@ -2,6 +2,7 @@
 
 import sqlite3
 import stat
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,12 +47,39 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _valid_title(title: str) -> bool:
+def _valid_stored_title(title: str) -> bool:
+    """Titles already on disk. Keeps rows written before stricter checks."""
     return (
         isinstance(title, str)
         and bool(title.strip())
         and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in title)
     )
+
+
+def _valid_title(title: str) -> bool:
+    """Reject blank, control, line-breaking, and invisible-only titles."""
+    if not _valid_stored_title(title):
+        return False
+    if any(unicodedata.category(char) in ("Zl", "Zp") for char in title):
+        return False
+    # Format characters (zero-width spaces, BOM, bidi marks) do not count as
+    # visible text. Joiners used inside emoji are format characters too, so
+    # drop them only for this check and keep them in the stored title.
+    visible = "".join(
+        char for char in title.strip() if unicodedata.category(char) != "Cf"
+    )
+    return bool(visible)
+
+
+def _require_task_id(task_id: int) -> None:
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or not 1 <= task_id <= MAX_TASK_ID
+    ):
+        raise ValueError(
+            "Task ID must be an integer between 1 and {}.".format(MAX_TASK_ID)
+        )
 
 
 def _valid_timestamp(value: str) -> bool:
@@ -68,7 +96,7 @@ def _task(row: sqlite3.Row) -> Task:
         row is None
         or not isinstance(row["id"], int)
         or not 1 <= row["id"] <= MAX_TASK_ID
-        or not _valid_title(row["title"])
+        or not _valid_stored_title(row["title"])
         or row["priority"] not in PRIORITIES
         or type(row["done"]) is not int
         or row["done"] not in (0, 1)
@@ -91,7 +119,12 @@ def _task(row: sqlite3.Row) -> Task:
 
 class TaskStore:
     def __init__(self, database: Optional[Path] = None, timeout: float = 5.0):
-        self.path = Path(database) if database is not None else default_database()
+        if database is None:
+            self.path = default_database()
+        else:
+            # Click leaves a leading ~ literal. Expand it for both --database and
+            # PROJECT_MANAGER_DB.
+            self.path = Path(database).expanduser()
         self.timeout = timeout
 
     @contextmanager
@@ -100,6 +133,7 @@ class TaskStore:
     ) -> Iterator[sqlite3.Connection]:
         connection = None
         try:
+            preexisting = False
             try:
                 file_mode = self.path.stat().st_mode
             except FileNotFoundError:
@@ -110,19 +144,25 @@ class TaskStore:
                         )
                     )
             else:
+                preexisting = True
                 if not stat.S_ISREG(file_mode):
                     raise StorageError(
                         "Database path must be a regular file: '{}'".format(self.path)
                     )
-            if create:
+            if create and not preexisting:
                 self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            mode = "rwc" if create else "rw" if write else "ro"
+            if create and not preexisting:
+                mode = "rwc"
+            elif write or create:
+                mode = "rw"
+            else:
+                mode = "ro"
             # A URI forces literal filenames such as ':memory:' and escapes ?/#.
             uri = self.path.absolute().as_uri() + "?mode=" + mode
             connection = sqlite3.connect(uri, uri=True, timeout=self.timeout)
             connection.row_factory = sqlite3.Row
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            self._schema(connection, create=create)
+            self._schema(connection, initialize=create and not preexisting)
             yield connection
             connection.commit()
         except (OSError, sqlite3.Error) as exc:
@@ -133,13 +173,15 @@ class TaskStore:
             if connection is not None:
                 connection.close()  # Rolls back an uncommitted transaction on failure.
 
-    def _schema(self, connection: sqlite3.Connection, create: bool) -> None:
+    def _schema(self, connection: sqlite3.Connection, initialize: bool) -> None:
         app_id = connection.execute("PRAGMA application_id").fetchone()[0]
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         objects = connection.execute(
             "SELECT name, type FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"
         ).fetchall()
-        if app_id == 0 and version == 0 and not objects and create:
+        # initialize is true only for a file this call created. A pre-existing
+        # blank SQLite file is someone else's database and must not be claimed.
+        if initialize and app_id == 0 and version == 0 and not objects:
             connection.execute(SCHEMA_SQL)
             connection.execute("PRAGMA application_id = {}".format(APPLICATION_ID))
             connection.execute("PRAGMA user_version = {}".format(SCHEMA_VERSION))
@@ -181,7 +223,8 @@ class TaskStore:
     def add(self, title: str, priority: str = "medium") -> Task:
         if not _valid_title(title):
             raise ValueError(
-                "Task title must be nonblank and must not contain control characters."
+                "Task title must contain a visible character and must not contain "
+                "control characters or line breaks."
             )
         title = title.strip()
         if priority not in PRIORITIES:
@@ -225,22 +268,8 @@ class TaskStore:
             ]
 
     def complete(self, task_id: int) -> Tuple[Task, bool]:
-        if (
-            isinstance(task_id, bool)
-            or not isinstance(task_id, int)
-            or not 1 <= task_id <= MAX_TASK_ID
-        ):
-            raise ValueError(
-                "Task ID must be an integer between 1 and {}.".format(MAX_TASK_ID)
-            )
-        try:
-            self.path.lstat()
-        except FileNotFoundError:
-            raise TaskNotFound("Task #{} does not exist.".format(task_id))
-        except OSError as exc:
-            raise StorageError(
-                "Cannot access task database '{}': {}".format(self.path, exc)
-            ) from exc
+        _require_task_id(task_id)
+        self._require_file(task_id)
         with self._connection(write=True) as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -270,3 +299,32 @@ class TaskStore:
                     "Task completion did not persist the requested data."
                 )
         return task, changed
+
+    def delete(self, task_id: int) -> Task:
+        """Delete one task. SQLite AUTOINCREMENT does not reuse its ID."""
+        _require_task_id(task_id)
+        self._require_file(task_id)
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFound("Task #{} does not exist.".format(task_id))
+            task = _task(row)
+            cursor = connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            remaining = connection.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()["n"]
+            if cursor.rowcount != 1 or remaining != 0:
+                raise StorageError("Task deletion did not persist the requested data.")
+        return task  # Only return success after commit.
+
+    def _require_file(self, task_id: int) -> None:
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            raise TaskNotFound("Task #{} does not exist.".format(task_id))
+        except OSError as exc:
+            raise StorageError(
+                "Cannot access task database '{}': {}".format(self.path, exc)
+            ) from exc

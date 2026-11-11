@@ -94,10 +94,14 @@ def test_parallel_additions_and_completions(run_cli, tmp_path):
         ("add", " "),
         ("add", "x", "-p", "bad"),
         ("add", "x\x1b[31m"),
+        ("add", "\u200b"),
+        ("add", "a\u2028b"),
         ("done", "0"),
         ("done", "-1"),
         ("done", "9223372036854775808"),
         ("done", "foo"),
+        ("delete", "0"),
+        ("delete", "foo"),
     ],
 )
 def test_invalid_cli_inputs(run_cli, tmp_path, args):
@@ -148,7 +152,9 @@ def test_default_store_survives_working_directory_change(run_cli, tmp_path):
     assert list(first.iterdir()) == list(second.iterdir()) == []
 
 
-@pytest.mark.parametrize("command", [("list",), ("add", "x"), ("done", "1")])
+@pytest.mark.parametrize(
+    "command", [("list",), ("add", "x"), ("done", "1"), ("delete", "1")]
+)
 def test_corruption_fails_without_false_success(run_cli, tmp_path, command):
     path = tmp_path / "db.sqlite3"
     original = b"corrupt data should not be erased"
@@ -171,6 +177,62 @@ def test_write_failure_is_clean(monkeypatch, tmp_path):
 
 
 def test_help_and_version_do_not_touch_database(run_cli, tmp_path):
-    assert run_cli("--help").returncode == 0
-    assert "0.2.0" in run_cli("--version").stdout
+    help_result = run_cli("--help")
+    assert help_result.returncode == 0
+    assert "delete" in help_result.stdout
+    assert "0.3.0" in run_cli("--version").stdout
     assert not (tmp_path / "db.sqlite3").exists()
+
+
+def test_long_title_is_not_truncated(run_cli):
+    title = "A" * 120
+    added = run_cli("add", title)
+    assert added.returncode == 0 and title in added.stdout
+    listed = run_cli("list", env_updates={"COLUMNS": "40"})
+    assert listed.returncode == 0 and title in listed.stdout
+    assert "…" not in listed.stdout
+
+
+def test_delete_removes_one_task_and_does_not_reuse_id(run_cli, tmp_path):
+    missing = run_cli("delete", "1")
+    assert missing.returncode != 0 and "does not exist" in missing.stderr
+    assert not (tmp_path / "db.sqlite3").exists()
+    assert run_cli("add", "keep").returncode == 0
+    assert run_cli("add", "drop me").returncode == 0
+    deleted = run_cli("delete", "2")
+    assert deleted.returncode == 0 and "Deleted task #2" in deleted.stdout
+    listed = run_cli("list")
+    assert "keep" in listed.stdout and "drop me" not in listed.stdout
+    again = run_cli("delete", "2")
+    assert again.returncode != 0 and "does not exist" in again.stderr
+    added = run_cli("add", "next")
+    assert added.returncode == 0 and "Added task #3" in added.stdout
+
+
+def test_tilde_database_path(run_cli, tmp_path):
+    home = tmp_path / "home"
+    added = run_cli(
+        "--database", "~/tasks.sqlite3", "add", "tilde task", database=False
+    )
+    assert added.returncode == 0, added.stderr
+    assert (home / "tasks.sqlite3").is_file()
+    assert not (tmp_path / "~").exists()
+    listed = run_cli("--database", "~/tasks.sqlite3", "list", database=False)
+    assert listed.returncode == 0 and "tilde task" in listed.stdout
+    from_env = run_cli(
+        "add",
+        "from env",
+        database=False,
+        env_updates={"PROJECT_MANAGER_DB": "~/env-tasks.sqlite3"},
+    )
+    assert from_env.returncode == 0, from_env.stderr
+    assert (home / "env-tasks.sqlite3").is_file()
+
+
+def test_existing_non_database_is_not_replaced(run_cli, tmp_path):
+    path = tmp_path / "db.sqlite3"
+    path.write_bytes(b"x")
+    result = run_cli("add", "x")
+    assert result.returncode != 0 and "Error:" in result.stderr
+    assert "Added task" not in result.stdout
+    assert path.read_bytes() == b"x"

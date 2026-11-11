@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "project-manager"
-version = "0.2.0"
-description = "A local SQLite-backed task management CLI."
+version = "0.3.0"
+description = "Local SQLite CLI to add, list, complete, and delete tasks."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -13,7 +13,7 @@ authors = [{ name = "Xu Jiaqi", email = "jiaqixu12138@gmail.com" }]
 dependencies = ["click>=8.0.0", "rich>=13.0.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7,<9", "build>=1,<2"]
+dev = ["pytest>=7,<9", "build>=1,<2", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/project_manager"]
